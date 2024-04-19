@@ -1,0 +1,345 @@
+---
+title: "DS_teamproj"
+output: html_document
+date: "2023-09-15"
+---
+
+```{r}
+library(dplyr)
+library(pROC)
+library(dplyr)
+library(caret)
+library(data.table)
+library(tidyverse)
+library(ggcorrplot)
+library(tree)
+library(randomForest)
+library(rpart)
+library(e1071)
+library(kernlab)
+source("DataAnalyticsFunctions.R")
+```
+
+```{r}
+data = read.csv("health.csv")
+summary(data)
+```
+
+We need to drop 'id', 'hospital_number', 'lesion_2' and 'lesion_3' and deal with 'lesion_1'
+```{r}
+# Convert 'lesion_1' column to character
+data$lesion_1 <- as.character(data$lesion_1)
+
+# Apply transformations to create new columns
+data$lesion1 <- ifelse(nchar(data$lesion_1) <= 4, paste0(data$lesion_1, strrep('0', max(0, 4 - nchar(data$lesion_1)))), substr(data$lesion_1, 1, 4))
+data$lesion_site <- ifelse(nchar(data$lesion1) == 5 & substr(data$lesion1, 1, 1) == '1', substr(data$lesion1, 1, 2), substr(data$lesion1, 1, 1))
+data$lesion_type <- ifelse(nchar(data$lesion1) == 5 & substr(data$lesion1, 1, 1) == '1', substr(data$lesion1, 3, 3), substr(data$lesion1, 2, 2))
+data$lesion_subtype <- ifelse(nchar(data$lesion1) == 5 & substr(data$lesion1, 1, 1) == '1', substr(data$lesion1, 4, 4), substr(data$lesion1, 3, 3))
+data$lesion_code <- ifelse(nchar(data$lesion1) == 5 & substr(data$lesion1, 1, 1) != '1', substr(data$lesion1, 4, 5), substr(data$lesion1, 3, 4))
+
+# Replace '7' with 'g' in 'lesion_type' column
+data$lesion_type[data$lesion_type == '7'] <- '0'
+
+# Remove unwanted columns
+data <- data[, !names(data) %in% c('id', 'hospital_number', 'lesion1', 'lesion_1', 'lesion_2', 'lesion_3')]
+```
+
+
+For all the 'None' (which is the missing values), we classify them into a new category called 'Unknow'
+For all the 'none', they are an avaible value which means that nothing observed in that variables
+```{r}
+data <- data %>% mutate_all(funs(ifelse(. == 'None', 'Unknown', .)))
+```
+
+transform into factor 
+```{r}
+data$surgery = as.factor(data$surgery)
+data$age = as.factor(data$age)
+data$temp_of_extremities = as.factor(data$temp_of_extremities)
+data$peripheral_pulse = as.factor(data$peripheral_pulse)
+data$mucous_membrane = as.factor(data$mucous_membrane)
+data$capillary_refill_time = as.factor(data$capillary_refill_time)
+data$pain = as.factor(data$pain)
+data$peristalsis = as.factor(data$peristalsis)
+data$abdominal_distention = as.factor(data$abdominal_distention)
+data$nasogastric_tube = as.factor(data$nasogastric_tube)
+data$nasogastric_reflux = as.factor(data$nasogastric_reflux)
+data$rectal_exam_feces = as.factor(data$rectal_exam_feces) 
+data$abdomen = as.factor(data$abdomen)
+data$abdomo_appearance = as.factor(data$abdomo_appearance)
+data$surgical_lesion = as.factor(data$surgical_lesion)
+data$cp_data = as.factor(data$cp_data)
+data$lesion_site = as.factor(data$lesion_site)
+data$lesion_type = as.factor(data$lesion_type)
+data$lesion_subtype = as.factor(data$lesion_subtype)
+data$lesion_code = as.factor(data$lesion_code)
+data$outcome = ifelse(data$outcome=='lived',1,0)
+data$outcome = as.factor(data$outcome)
+summary(data)
+```
+
+We used tableau for data visualization
+
+k-mean
+```{r}
+### k-means
+xdata <- model.matrix(outcome ~ ., data=data)
+FourCenters <- kmeans(xdata,4,nstart=30)
+### Centers
+FourCenters$centers[1,]
+FourCenters$centers[2,]
+FourCenters$centers[3,]
+FourCenters$centers[4,]
+### Sizes of clusters
+FourCenters$size
+### variation explained with 4 clusters
+1 - FourCenters$tot.withinss/ FourCenters$totss
+### near 50%
+aggregate( data$total_protein ~ FourCenters$cluster, FUN = mean )
+aggregate( (data$pain %in% c('alert','extreme_pain','severe_pain','depressed')) ~ FourCenters$cluster, FUN = mean )
+
+### how these segments relate to churn? 
+### Remember, churn was not used to create them.
+aggregate(data$outcome=="0"~FourCenters$cluster, FUN=mean)
+```
+
+
+```{r}
+Mx<- model.matrix(outcome ~ .^2, data=data)[,-1]
+My<- data$outcome == 1
+```
+
+Model building
+```{r}
+n <- nrow(data)
+nfold <- 10
+foldid <- rep(1:nfold,each=ceiling(n/nfold))[sample(1:n)]
+Accuracy <- data.frame(m.null=rep(NA,nfold), m.tree=rep(NA,nfold), m.rf=rep(NA,nfold), m.cart=rep(NA,nfold), m.svm=rep(NA,nfold)) 
+AUC <- data.frame(m.null=rep(NA,nfold), m.tree=rep(NA,nfold), m.rf=rep(NA,nfold), m.cart=rep(NA,nfold),m.svm=rep(NA,nfold)) 
+R2 <- data.frame(m.null = rep(NA, nfold), m.tree = rep(NA, nfold), m.rf = rep(NA, nfold), m.cart = rep(NA, nfold), m.svm = rep(NA, nfold))
+
+set.seed(42)
+for(k in 1:nfold){ 
+  train <- which(foldid!=k) # train on all but fold `k'
+  
+  ### NULL model
+  m.null <- glm(outcome==1~1, data=data, subset=train, family="binomial")
+  pred.null <- predict(m.null, newdata=data[-train,], type="response")
+  pred.null <- ifelse(pred.null > 0.5, 1, 0) 
+  true_labels <- data[-train,]$outcome == 1 
+  Accuracy$m.null[k] <- mean(pred.null == true_labels)
+  roc.null <- roc(true_labels, pred.null) 
+  AUC$m.null[k] <- auc(roc.null)
+  R2$m.null[k] <- 1 - sum((true_labels - pred.null)^2) / sum((true_labels - mean(true_labels))^2)
+  
+  ### classification tree
+  m.tree <- tree(outcome~ ., data=data, subset=train) 
+  pred.tree <- predict(m.tree, newdata=data[-train,], type="vector")
+  pred.tree <- pred.tree[,2]
+  pred.tree <- ifelse(pred.tree > 0.5, 1, 0) 
+  Accuracy$m.tree[k] <- mean(pred.tree == true_labels)
+  roc.tree <- roc(true_labels, pred.tree) 
+  AUC$m.tree[k] <- auc(roc.tree)
+  R2$m.tree[k] <- 1 - sum((true_labels - pred.tree)^2) / sum((true_labels - mean(true_labels))^2)
+  
+  ### random forest
+  m.rf <- randomForest(outcome~., data=data, subset=train, nodesize=5, ntree = 1000, mtry = 4)
+  pred.rf <- as.vector(predict(m.rf, newdata = data[-train,], type = "prob")[, "1"])
+  pred.rf <- ifelse(pred.rf > 0.5, 1, 0) 
+  Accuracy$m.rf[k] <- mean(pred.rf == true_labels)
+  roc.rf <- roc(true_labels, pred.rf)
+  AUC$m.rf[k] <- auc(roc.rf)
+  R2$m.rf[k] <- 1 - sum((true_labels - pred.rf)^2) / sum((true_labels - mean(true_labels))^2)
+  
+  ### CART
+  m.cart <- randomForest(outcome~., data=data, subset=train, method = 'class')
+  pred.cart <- as.vector(predict(m.cart, newdata = data[-train,], type = "prob")[, "1"])
+  pred.cart <- ifelse(pred.cart > 0.5, 1, 0) 
+  Accuracy$m.cart[k] <- mean(pred.cart == true_labels)
+  roc.cart <- roc(true_labels, pred.cart)
+  AUC$m.cart[k] <- auc(roc.cart)
+  R2$m.cart[k] <- 1 - sum((true_labels - pred.cart)^2) / sum((true_labels - mean(true_labels))^2)
+  
+  ### SVM
+  m.svm <- ksvm(outcome~., data = data[train,], type = "C-svc", prob.model = TRUE)
+  pred.svm <- as.vector(predict(m.svm,newdata=data[-train,],type = "probabilities")[,"1"])
+  pred.svm <- ifelse(pred.svm > 0.5, 1, 0) 
+  Accuracy$m.svm[k] <- mean(pred.svm == true_labels)
+  roc.svm <- roc(true_labels, pred.svm)
+  AUC$m.svm[k] <- auc(roc.svm)
+  R2$m.svm[k] <- 1 - sum((true_labels - pred.svm)^2) / sum((true_labels - mean(true_labels))^2)
+}
+
+Accuracy
+AUC
+R2
+```
+
+Model Selection
+```{r}
+accuracy_means <- colMeans(Accuracy)
+auc_means <- colMeans(AUC)
+R2_means = colMeans(R2)
+results <- data.frame('Accuracy' = accuracy_means, 'AUC' = auc_means, 'R2' = R2_means)
+results
+```
+
+compare the OOS Accuracy
+```{r}
+results$Model <- factor(rownames(results), levels = rownames(results))
+ggplot(results, aes(x = Model, y = Accuracy)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  geom_text(aes(label = sprintf("%.3f", Accuracy), vjust = -0.5), size = 3) +
+  labs(
+    title = "Out-of-sample Accuracy for all the models",
+    x = "Model",
+    y = "Accuracy"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+compare the AUC
+```{r}
+ggplot(results, aes(x = Model, y = AUC)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  geom_text(aes(label = sprintf("%.3f", AUC), vjust = -0.5), size = 3) +
+  labs(
+    title = "Out-of-sample AUC for all the models",
+    x = "Model",
+    y = "AUC"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+compare the OOS R_square
+```{r}
+ggplot(results, aes(x = Model, y = R2)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  geom_text(aes(label = sprintf("%.3f", R2), vjust = -0.5), size = 3) +
+  labs(
+    title = "Out-of-sample Rsquare for all the models",
+    x = "Model",
+    y = "R_square"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+Prediction for Decision Tree
+```{r}
+train <- which(foldid!=1)
+m.tree <- tree(outcome~ ., data=data, subset=train) 
+pred.tree <- predict(m.tree, type="vector")
+pred.tree <- pred.tree[,2]
+hist(pred.tree, breaks = 40,main="Prediction for Decision Tree")
+```
+
+Prediction for Random Forest
+```{r}
+train <- which(foldid!=1)
+m.rf <- randomForest(outcome~., data=data, subset=train, nodesize=5, ntree = 1000, mtry = 4)
+pred.rf <- predict(m.rf,type = "prob")[,2]
+hist(pred.rf, breaks = 40,main="Prediction for Random Forest")
+```
+
+Prediction for CART
+```{r}
+train <- which(foldid!=1)
+m.cart <- randomForest(outcome~., data=data, subset=train, method = 'class')
+pred.cart <- as.vector(predict(m.cart, type = "prob")[, "1"])
+hist(pred.cart, breaks = 40,main="Prediction for CART")
+```
+
+Prediction for SVM
+```{r}
+train <- which(foldid!=1)
+m.svm <- ksvm(outcome~., data = data[train,], type = "C-svc", prob.model = TRUE)
+pred.svm <- as.vector(predict(m.svm,newdata = data[train,], type = "probabilities")[,"1"])
+hist(pred.svm, breaks = 40,main="Prediction for SVM")
+sum(pred.rf==0)
+```
+
+We choose Random Forest and run the model with the whole data
+```{r, fig.width=5, fig.height=5,fig.asp=1}
+roc_curve <- function(p,y, ...){
+  y <- factor(y)
+  n <- length(p)
+  p <- as.vector(p)
+  Q <- p > matrix(rep(seq(0,1,length=100),n),ncol=100,byrow=TRUE)
+  specificity <- colMeans(!Q[y==levels(y)[1],])
+  sensitivity <- colMeans(Q[y==levels(y)[2],])
+  plot(1-specificity, sensitivity,  ylab="TPR", xlab="FPR",type="l", main="ROC Curve", asp = 1, xlim = c(min(1-specificity),max(1-specificity)), ylim = c(min(sensitivity),max(sensitivity)))
+  abline(a=0,b=1,lty=2,col=8)
+  ROCcurve <-as.data.frame( cbind( 1-specificity,  sensitivity))
+  return (ROCcurve)
+}
+
+set.seed(1)
+train <- which(foldid!=c(9,10))
+model <- randomForest(outcome~., data=data, subset = train, nodesize=5, ntree = 1000, mtry = 4)
+summary(model)
+pred <- predict(model, newdata = data[-train,], type = "prob")[,2]
+roccurve <-  roc_curve(p=pred, y=My[-train], bty="n")
+```
+
+
+Assign scores according to probability
+```{r}
+pred_score = data.frame(pred=pred, score = (1-abs(pred-0.5)*2))
+head(pred_score)
+```
+
+Profit curve
+```{r}
+My_pred = as.vector(My[-train])
+cost.benefit.m = c(1.1,-1,0,0)
+profictcurveOrder <- function(score, y, cost.benefit.m, K=100,...)
+{
+
+  threshold <-seq(from=min(score), to=max(score), by= (max(score)-min(score))/K)  
+  profit <- rep(0,length(threshold))
+  prop <- rep(0,length(threshold))
+  for( i in 1:length(threshold) ){
+    thr <- threshold[1+length(threshold)-i]
+    confusion.matrix <- c( sum( (score>=thr) * My_pred ),  sum( (score>=thr) * !My_pred ) , sum( (score<thr) * My_pred ),  sum( (score<thr) * !My_pred))
+    
+  ### Expected profit
+    profit[i] <- t(cost.benefit.m) %*% confusion.matrix
+    prop[i] <- sum( (score>=thr) ) / length(score)
+  }
+  plot(prop,profit, type="l", xlab="Proportion of population", ylab="Profit", main="Profit Curve")
+  #plot(prop,1-threshold, type="l", xlab="Proportion of population", ylab="Death Rate", main="Ranking of Horses")
+}
+
+profictcurveOrder(pred_score$score,pred_score$pred,cost.benefit.m,K=100)
+```
+
+Find the threshold
+```{r}
+threshold <- quantile(pred_score$score, 0.32)
+threshold
+# Find the corresponding "pred" value
+min(pred_score[pred_score$score>threshold,]$pred)
+max(pred_score[pred_score$score>threshold,]$pred)
+```
+
+Confusion matrix
+```{r}
+pred.max = ifelse((pred>=0.156 & pred<=0.835),TRUE,FALSE)
+table(pred.max,My[-train])
+44*1.1-37
+```
+
+Importance of variables
+```{r}
+importance_scores <- importance(model)
+variable_names <- rownames(importance_scores)
+scores <- importance_scores[, 1] 
+importance_data <- data.frame(Variable = variable_names, Importance = scores)
+head(importance_data[order(importance_data$Importance, decreasing = TRUE), ], 10)
+```
+
